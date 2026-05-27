@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Kräuterwald - ein Sammel-Abenteuer</title>
+<style>
+  html,body{margin:0;height:100%;background:#bfe9a8;font-family:system-ui,sans-serif;color:#234023;overflow:hidden}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{image-rendering:pixelated;background:#bfe9a8;box-shadow:0 8px 32px rgba(40,80,40,.25);border-radius:12px;max-width:100%;max-height:100%}
+  #hud{position:absolute;top:14px;left:50%;transform:translateX(-50%);background:rgba(255,255,255,.78);padding:6px 14px;border-radius:999px;font-weight:700;letter-spacing:.5px;font-size:14px;display:flex;gap:14px;align-items:center;pointer-events:none}
+  #hud .pill{display:inline-flex;align-items:center;gap:6px}
+  #hint{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);background:rgba(255,255,255,.7);padding:6px 12px;border-radius:999px;font-size:12px;color:#3a5a3a}
+  #overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(50,80,50,.55);backdrop-filter:blur(4px)}
+  #overlay .card{background:#fff;border-radius:18px;padding:24px 28px;text-align:center;max-width:380px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+  #overlay h1{margin:0 0 8px;font-size:22px}
+  #overlay p{margin:6px 0;color:#456}
+  #overlay button{margin-top:14px;background:#5cb85c;color:#fff;border:0;padding:10px 22px;font-weight:700;border-radius:999px;cursor:pointer;font-size:15px}
+  #overlay button:hover{background:#4ca84c}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="640" height="360"></canvas>
+  <div id="hud">
+    <span class="pill">Kräuter <span id="herbs">0</span>/<span id="herbsTotal">0</span></span>
+    <span class="pill">Leben <span id="lives">3</span></span>
+    <span class="pill">Level <span id="level">1</span></span>
+  </div>
+  <div id="hint">Pfeiltasten / WASD bewegen &nbsp;·&nbsp; Leertaste / W springen</div>
+  <div id="overlay"><div class="card">
+    <h1 id="ovTitle">Willkommen im Kräuterwald</h1>
+    <p id="ovText">Sammle alle Heilkräuter und finde den Ausgang am rechten Waldrand. Vorsicht vor den brummigen Bienen!</p>
+    <button id="ovBtn">Los geht's</button>
+  </div></div>
+</div>
+<script>
+(() => {
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+const W = cvs.width, H = cvs.height;
+const keys = {};
+const GAMEPLAY_KEYS = ['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD'];
+addEventListener('keydown', e => {
+  keys[e.code]=true;
+  if(GAMEPLAY_KEYS.includes(e.code)) e.preventDefault();
+  // jump buffer: remember a jump press for a few frames so a slightly early press still triggers a jump on landing
+  if(e.code==='Space'||e.code==='ArrowUp'||e.code==='KeyW') jumpBuffer = 8;
+});
+addEventListener('keyup',   e => {
+  keys[e.code]=false;
+  // variable jump height: releasing jump while rising cuts the upward velocity short
+  if((e.code==='Space'||e.code==='ArrowUp'||e.code==='KeyW') && player && player.vy<-2) player.vy = -2;
+});
+
+// --- audio (simple WebAudio beeps, lazy init) ---
+let audioCtx = null;
+function beep(freq, dur=0.08, type='square', vol=0.05, slide=0){
+  try {
+    if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type=type; o.frequency.value=freq;
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(40,freq+slide), audioCtx.currentTime+dur);
+    g.gain.value=vol;
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime+dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime+dur);
+  } catch(_) {}
+}
+let jumpBuffer = 0;   // frames remaining where a buffered jump press is still valid
+let coyote = 0;       // frames since leaving ground where a jump is still allowed
+
+// ---------- LEVELS ----------
+// Tile legend: . empty  # grass-top  = dirt  T tree  F flower bush  P player start  H herb  B bee patrol  X exit
+const LEVELS = [
+{name:"Lichtung", w:80, h:18, rows:[
+"................................................................................",
+"................................................................................",
+"................................................................................",
+"................................................................................",
+"...........H..............H.....................H..............................",
+"..........###............####...........H......####..................H.........",
+"......................................########..........H...................X.",
+".................H............................................############....",
+"................###........................H..........H........................",
+"......P......................######....########....######......................",
+"................................................................................",
+"################################################################################",
+"================================================================================",
+"================================================================================",
+"================================================================================",
+"================================================================================",
+"================================================================================",
+"================================================================================",
+]},
+{name:"Tiefer Wald", w:96, h:18, rows:[
+"................................................................................................",
+"................................................................................................",
+".............H.................H.............................H.................................",
+"............####...............####.....................H....####...............H..............",
+"........................................H............########.................########.........",
+".....H..........................B.....####.........................H...........................",
+"....####.......H......H..............................B.........####............................",
+"...........##########............................H.......H............H........................",
+"......................................H........####....####.........####...................X..",
+".......P.........B...........H........####.................................B.......############",
+"#########################......################################################################",
+"================================================================================================",
+"================================================================================================",
+"================================================================================================",
+"================================================================================================",
+"================================================================================================",
+"================================================================================================",
+"================================================================================================",
+]},
+{name:"Sonnenhang", w:110, h:18, rows:[
+"..............................................................................................................",
+"..............................................................................................................",
+"...........H...........................H...........H............................H..........H................",
+"..........####.........H..............####........####.........H................####.......####.............",
+"........................####...............................H..####.....H...........................H.......",
+".....H.................................H..............####............####..........................####..",
+"....####....B................H........####...........................................H.......B..............",
+"............................####.....................................B..............####....................",
+"......................H..............................................................................H......",
+".......P.............####......B.......H.....B.........H.......H.................H.............B.....####X.",
+"##########............................####...........####.....####..............####........####............",
+"================================================================================================================".substr(0,110),
+"================================================================================================================".substr(0,110),
+"================================================================================================================".substr(0,110),
+"================================================================================================================".substr(0,110),
+"================================================================================================================".substr(0,110),
+"================================================================================================================".substr(0,110),
+"================================================================================================================".substr(0,110),
+]},
+];
+
+const TS = 20; // tile size in px
+let level = null, levelIdx = 0;
+let player, herbs, bees, exitTile, cam, particles, herbsTotal, herbsGot;
+let lives = 3, state = 'intro';
+
+function loadLevel(idx, keepHerbs){
+  const prevTaken = keepHerbs && herbs ? herbs.map(h=>!!h.taken) : null;
+  const L = LEVELS[idx];
+  level = {w:L.w, h:L.h, rows:L.rows, name:L.name};
+  herbs=[]; bees=[]; particles=[]; exitTile=null;
+  herbsGot=0; herbsTotal=0;
+  let spawn={x:60,y:60};
+  for(let y=0;y<L.h;y++){
+    for(let x=0;x<L.w;x++){
+      const c = L.rows[y][x];
+      if(c==='P') spawn={x:x*TS+2,y:y*TS-4};
+      else if(c==='H'){ herbs.push({x:x*TS+TS/2,y:y*TS+TS/2,t:Math.random()*6, taken:false, kind:Math.floor(Math.random()*3)}); herbsTotal++; }
+      else if(c==='B'){ bees.push({x:x*TS+TS/2,y:y*TS+TS/2,dir:1,baseX:x*TS+TS/2,range:50+Math.random()*40,phase:Math.random()*6}); }
+      else if(c==='X'){ exitTile={x:x*TS,y:y*TS}; }
+    }
+  }
+  if(prevTaken){
+    herbs.forEach((h,i)=>{ if(prevTaken[i]){ h.taken=true; herbsGot++; } });
+  }
+  player = {x:spawn.x, y:spawn.y, vx:0, vy:0, w:14, h:18, onGround:false, face:1, anim:0, hurt:0};
+  cam = {x:0};
+  jumpBuffer = 0; coyote = 0;
+  document.getElementById('herbs').textContent=herbsGot;
+  document.getElementById('herbsTotal').textContent=herbsTotal;
+  document.getElementById('level').textContent=(idx+1);
+}
+
+function solidAt(tx,ty){
+  if(tx<0||ty<0||tx>=level.w||ty>=level.h) return ty>=level.h;
+  const c = level.rows[ty][tx];
+  return c==='#' || c==='=';
+}
+
+function rectVsTiles(x,y,w,h){
+  const x0 = Math.floor(x/TS), x1=Math.floor((x+w-1)/TS);
+  const y0 = Math.floor(y/TS), y1=Math.floor((y+h-1)/TS);
+  for(let ty=y0;ty<=y1;ty++) for(let tx=x0;tx<=x1;tx++) if(solidAt(tx,ty)) return true;
+  return false;
+}
+
+function moveAxis(o, dx, dy){
+  // move X
+  let nx = o.x + dx;
+  if(rectVsTiles(nx,o.y,o.w,o.h)){
+    const step = dx>0?1:-1;
+    while(!rectVsTiles(o.x+step,o.y,o.w,o.h) && Math.abs(o.x-nx)>0.5){ o.x += step; }
+    o.vx = 0;
+  } else o.x = nx;
+  // move Y
+  let ny = o.y + dy;
+  if(rectVsTiles(o.x,ny,o.w,o.h)){
+    const step = dy>0?1:-1;
+    while(!rectVsTiles(o.x,o.y+step,o.w,o.h) && Math.abs(o.y-ny)>0.5){ o.y += step; }
+    if(dy>0) o.onGround = true;
+    o.vy = 0;
+  } else { o.y = ny; o.onGround = false; }
+}
+
+function spawnParticles(x,y,col,n=8){
+  for(let i=0;i<n;i++) particles.push({x,y,vx:(Math.random()-.5)*2.5,vy:-Math.random()*2-.5,life:30+Math.random()*20,col});
+}
+
+function update(dt){
+  if(state!=='play') return;
+
+  // input (locked out briefly after taking damage so knockback is felt)
+  const inputLocked = player.hurt > 48;
+  const left = !inputLocked && (keys['ArrowLeft']||keys['KeyA']);
+  const right= !inputLocked && (keys['ArrowRight']||keys['KeyD']);
+  const accel = 0.6, maxS = 2.2, fric = 0.78;
+  if(left){ player.vx -= accel; player.face=-1; }
+  if(right){ player.vx += accel; player.face=1; }
+  if(!left && !right) player.vx *= fric;
+  player.vx = Math.max(-maxS, Math.min(maxS, player.vx));
+
+  // gravity
+  player.vy += 0.32;
+  if(player.vy>6) player.vy=6;
+
+  // jump with coyote time + jump buffer
+  if(jumpBuffer>0) jumpBuffer--;
+  if(player.onGround) coyote = 6; else if(coyote>0) coyote--;
+  if(jumpBuffer>0 && coyote>0 && !inputLocked){
+    player.vy = -5.4;
+    player.onGround = false;
+    coyote = 0;
+    jumpBuffer = 0;
+    spawnParticles(player.x+7,player.y+18,'#d8b07a',5);
+    beep(520, 0.09, 'square', 0.04, 220);
+  }
+
+  player.onGround = false;
+  moveAxis(player, player.vx, 0);
+  moveAxis(player, 0, player.vy);
+
+  player.anim += Math.abs(player.vx)*0.2;
+  if(player.hurt>0) player.hurt--;
+
+  // bees
+  bees.forEach(b=>{
+    const prevX = b.x;
+    b.phase += dt*0.004;
+    b.x = b.baseX + Math.sin(b.phase)*b.range;
+    b.y += Math.sin(b.phase*2.3)*0.3;
+    b.dir = (b.x - prevX) >= 0 ? 1 : -1;
+    // circular hitbox feels fairer than the old 20x20 square
+    const dx = b.x - (player.x+player.w/2);
+    const dy = b.y - (player.y+player.h/2);
+    if(player.hurt===0 && dx*dx + dy*dy < 9*9){
+      player.hurt=60; lives--; document.getElementById('lives').textContent=lives;
+      player.vy=-4; player.vx = (player.x<b.x?-2.8:2.8);
+      spawnParticles(player.x+7,player.y+9,'#ff7777',12);
+      beep(180, 0.18, 'sawtooth', 0.06, -80);
+      if(lives<=0){ state='over'; showOverlay('Ohje!', 'Die Kräuter warten auf einen neuen Versuch.', 'Nochmal'); }
+    }
+  });
+
+  // herbs
+  herbs.forEach(h=>{
+    if(h.taken) return;
+    h.t += dt*0.005;
+    if(Math.abs(h.x-(player.x+player.w/2))<12 && Math.abs(h.y-(player.y+player.h/2))<14){
+      h.taken=true; herbsGot++;
+      document.getElementById('herbs').textContent=herbsGot;
+      spawnParticles(h.x,h.y,'#a3e065',14);
+      beep(880 + herbsGot*30, 0.10, 'triangle', 0.05, 200);
+    }
+  });
+
+  // exit
+  if(exitTile && herbsGot>=herbsTotal){
+    if(Math.abs(exitTile.x+TS/2-(player.x+player.w/2))<14 && Math.abs(exitTile.y+TS/2-(player.y+player.h/2))<18){
+      if(levelIdx+1<LEVELS.length){
+        levelIdx++; state='intro'; loadLevel(levelIdx);
+        beep(660,0.12,'triangle',0.06,300);
+        setTimeout(()=>beep(990,0.18,'triangle',0.06,200),120);
+        showOverlay('Level geschafft!', `Auf zum ${LEVELS[levelIdx].name}!`, 'Weiter');
+      } else {
+        state='win';
+        beep(660,0.12,'triangle',0.06,300);
+        setTimeout(()=>beep(990,0.14,'triangle',0.06,200),120);
+        setTimeout(()=>beep(1320,0.2,'triangle',0.06,200),260);
+        showOverlay('Alle Kräuter gesammelt!', `Du hast den ganzen Wald erkundet. Wundervoll!`, 'Von vorne');
+      }
+    }
+  }
+
+  // fall out
+  if(player.y > level.h*TS+40){
+    lives--; document.getElementById('lives').textContent=lives;
+    beep(180, 0.22, 'sawtooth', 0.06, -120);
+    if(lives<=0){ state='over'; showOverlay('Ohje!','Versuche es noch einmal.','Nochmal'); }
+    else { loadLevel(levelIdx, true); } // keep already-collected herbs
+  }
+
+  // particles
+  particles.forEach(p=>{ p.x+=p.vx; p.y+=p.vy; p.vy+=0.12; p.life--; });
+  particles = particles.filter(p=>p.life>0);
+
+  // camera
+  const target = Math.max(0, Math.min(level.w*TS - W, player.x - W/2));
+  cam.x += (target - cam.x)*0.12;
+}
+
+// ---------- DRAWING ----------
+function drawSky(){
+  // soft gradient sky
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#fef9d7');
+  g.addColorStop(0.5,'#d6f1c8');
+  g.addColorStop(1,'#a8dc92');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  // sun
+  ctx.fillStyle='rgba(255,240,170,0.7)';
+  ctx.beginPath(); ctx.arc(W-70,60,38,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='rgba(255,250,200,0.5)';
+  ctx.beginPath(); ctx.arc(W-70,60,56,0,Math.PI*2); ctx.fill();
+  // far hills (parallax)
+  ctx.fillStyle='#b6d99a';
+  drawHills(cam.x*0.15, 220, 120, 12, '#c2e2a4');
+  drawHills(cam.x*0.3,  260, 80,  9,  '#a8d28a');
+  // distant trees
+  for(let i=0;i<14;i++){
+    const x = ((i*120) - cam.x*0.4) % (W+200);
+    const xx = (x+W+200)%(W+200) - 100;
+    drawTreeFar(xx, 240);
+  }
+}
+function drawHills(offset,baseY,amp,seg,col){
+  ctx.fillStyle=col;
+  ctx.beginPath(); ctx.moveTo(-10,H);
+  for(let x=-10;x<=W+10;x+=20){
+    const y = baseY + Math.sin((x+offset)/seg/10)*amp*0.3 + Math.sin((x+offset)/30)*amp*0.15;
+    ctx.lineTo(x,y);
+  }
+  ctx.lineTo(W+10,H); ctx.closePath(); ctx.fill();
+}
+function drawTreeFar(x,y){
+  ctx.fillStyle='#7fb878';
+  ctx.beginPath(); ctx.arc(x,y,16,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x-10,y+4,12,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+10,y+4,12,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#6b4a2a'; ctx.fillRect(x-2,y+10,4,10);
+}
+
+function drawWorld(){
+  const x0 = Math.floor(cam.x/TS)-1, x1 = Math.ceil((cam.x+W)/TS)+1;
+  for(let y=0;y<level.h;y++){
+    for(let tx=x0;tx<=x1;tx++){
+      if(tx<0||tx>=level.w) continue;
+      const c = level.rows[y][tx];
+      const px = tx*TS - cam.x, py = y*TS;
+      if(c==='#'){ // grass top
+        ctx.fillStyle='#7ac74f'; ctx.fillRect(px,py,TS,TS);
+        ctx.fillStyle='#5fa83a'; ctx.fillRect(px,py,TS,5);
+        ctx.fillStyle='#9fdc6e';
+        ctx.fillRect(px+2,py+1,2,2); ctx.fillRect(px+8,py,2,3); ctx.fillRect(px+14,py+1,2,2);
+        ctx.fillStyle='#8d6a43'; // dirt below hint
+        ctx.fillRect(px,py+TS-3,TS,3);
+      } else if(c==='='){ // dirt
+        ctx.fillStyle='#a87a4b'; ctx.fillRect(px,py,TS,TS);
+        ctx.fillStyle='#8a5f37'; ctx.fillRect(px+3,py+6,3,2);
+        ctx.fillRect(px+12,py+12,3,2);
+        ctx.fillStyle='#b88a5a'; ctx.fillRect(px+8,py+3,2,2);
+      } else if(c==='X'){
+        // exit: glowing portal / signpost
+        const t = performance.now()*0.004;
+        ctx.fillStyle='#fff5b0'; ctx.globalAlpha=0.6+Math.sin(t)*0.2;
+        ctx.beginPath(); ctx.arc(px+TS/2,py+TS/2,16,0,Math.PI*2); ctx.fill();
+        ctx.globalAlpha=1;
+        ctx.fillStyle='#6b4a2a'; ctx.fillRect(px+TS/2-1,py-6,2,TS+6);
+        ctx.fillStyle='#f4c862'; ctx.fillRect(px+TS/2-7,py-6,14,8);
+        ctx.fillStyle='#6b4a2a'; ctx.fillRect(px+TS/2-2,py-3,4,2);
+      }
+    }
+  }
+  // foreground decoration: tree trunks behind tiles
+  // (drawn as part of background already via parallax)
+}
+
+function drawHerbs(){
+  herbs.forEach(h=>{
+    if(h.taken) return;
+    const px = h.x - cam.x, py = h.y + Math.sin(h.t)*2;
+    // stem
+    ctx.fillStyle='#3a8a3a'; ctx.fillRect(px-1,py-2,2,8);
+    // leaves
+    ctx.fillStyle = ['#7ddc6a','#9fe87b','#6cc858'][h.kind];
+    ctx.beginPath(); ctx.ellipse(px-3,py,3,2,-0.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(px+3,py,3,2,0.5,0,Math.PI*2); ctx.fill();
+    // flower
+    const fcol = ['#ff9ec7','#fff3a5','#c5a8ff'][h.kind];
+    ctx.fillStyle=fcol;
+    ctx.beginPath(); ctx.arc(px,py-4,3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#fff7c2';
+    ctx.fillRect(px-1,py-5,2,2);
+    // sparkle
+    if(Math.sin(h.t*3)>0.85){
+      ctx.fillStyle='#fff'; ctx.fillRect(px+5,py-6,1,1); ctx.fillRect(px+6,py-5,1,1);
+    }
+  });
+}
+
+function drawBees(){
+  bees.forEach(b=>{
+    const px = b.x - cam.x, py = b.y;
+    // wings
+    ctx.fillStyle='rgba(255,255,255,0.7)';
+    const wf = Math.sin(performance.now()*0.05)>0?2:1;
+    ctx.beginPath(); ctx.ellipse(px-2,py-3,3,wf,0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(px+2,py-3,3,wf,0,0,Math.PI*2); ctx.fill();
+    // body
+    ctx.fillStyle='#f4c542'; ctx.beginPath(); ctx.ellipse(px,py,5,4,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#2a2a2a'; ctx.fillRect(px-3,py-1,1.5,3); ctx.fillRect(px+1,py-1,1.5,3);
+    // eye
+    ctx.fillStyle='#222'; ctx.fillRect(px+(b.dir>0?2:-3),py-2,1,1);
+  });
+}
+
+function drawPlayer(){
+  const px = player.x - cam.x, py = player.y;
+  if(player.hurt>0 && (player.hurt%6<3)) return;
+  const step = Math.floor(player.anim)%2;
+  const skin = '#f8d8b0', dress='#e85a8a', dressDk='#b83a6a', dressTrim='#fff3c2';
+  const hair='#a86b3a', hairLt='#c98a4f';
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,0.18)'; ctx.beginPath(); ctx.ellipse(px+7,py+19,8,2,0,0,Math.PI*2); ctx.fill();
+
+  // legs / boots (peeking under dress)
+  ctx.fillStyle='#6b4a2a';
+  if(!player.onGround){
+    ctx.fillRect(px+3,py+16,3,3); ctx.fillRect(px+8,py+16,3,3);
+  } else if(Math.abs(player.vx)>0.3){
+    if(step){ ctx.fillRect(px+2,py+16,3,2); ctx.fillRect(px+9,py+16,3,2); }
+    else    { ctx.fillRect(px+4,py+16,3,2); ctx.fillRect(px+7,py+16,3,2); }
+  } else {
+    ctx.fillRect(px+4,py+16,3,2); ctx.fillRect(px+7,py+16,3,2);
+  }
+
+  // dress (A-line: narrow at top, wide at bottom)
+  ctx.fillStyle = dress;
+  ctx.fillRect(px+3,py+9,8,4);       // bodice
+  ctx.fillRect(px+2,py+12,10,3);     // mid
+  ctx.fillRect(px+1,py+14,12,3);     // hem
+  // dress shading
+  ctx.fillStyle = dressDk;
+  ctx.fillRect(px+1,py+16,12,1);
+  ctx.fillRect(px+3,py+9,1,4);
+  // white apron/trim
+  ctx.fillStyle = dressTrim;
+  ctx.fillRect(px+5,py+10,4,5);
+  ctx.fillRect(px+1,py+15,12,1);
+  // collar
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(px+5,py+9,4,1);
+
+  // arms
+  ctx.fillStyle = skin;
+  if(!player.onGround){
+    ctx.fillRect(px+1,py+8,2,4); ctx.fillRect(px+11,py+8,2,4);
+  } else {
+    const ay = step? 10:11;
+    ctx.fillRect(px+1,py+ay,2,3); ctx.fillRect(px+11,py+ay,2,3);
+  }
+  // little flower basket on one arm
+  ctx.fillStyle='#a87a4b'; ctx.fillRect(px+11,py+13,3,2);
+  ctx.fillStyle='#7ddc6a'; ctx.fillRect(px+12,py+12,1,1);
+  ctx.fillStyle='#ffd6e8'; ctx.fillRect(px+11,py+12,1,1);
+
+  // head
+  ctx.fillStyle = skin; ctx.fillRect(px+3,py+2,8,7);
+  // hair: long, with bangs
+  ctx.fillStyle = hair;
+  ctx.fillRect(px+2,py+1,10,3);          // top
+  ctx.fillRect(px+2,py+3,2,6);           // left side strand
+  ctx.fillRect(px+10,py+3,2,6);          // right side strand
+  ctx.fillRect(px+3,py+3,8,1);           // bangs
+  ctx.fillStyle = hairLt;
+  ctx.fillRect(px+4,py+1,2,1); ctx.fillRect(px+8,py+2,2,1);
+  // little flower in hair
+  ctx.fillStyle='#ffd6e8'; ctx.fillRect(player.face>0?px+9:px+3,py+1,2,2);
+  ctx.fillStyle='#ffec7a'; ctx.fillRect(player.face>0?px+9:px+4,py+2,1,1);
+
+  // eyes (two for a friendlier face)
+  ctx.fillStyle='#3a2a22';
+  if(player.face>0){ ctx.fillRect(px+6,py+5,1,2); ctx.fillRect(px+9,py+5,1,2); }
+  else            { ctx.fillRect(px+4,py+5,1,2); ctx.fillRect(px+7,py+5,1,2); }
+  // cheeks
+  ctx.fillStyle='#ffb0c4';
+  ctx.fillRect(px+4,py+7,1,1); ctx.fillRect(px+10,py+7,1,1);
+  // smile
+  ctx.fillStyle='#c46a7a'; ctx.fillRect(px+(player.face>0?7:6),py+7,2,1);
+}
+
+function drawParticles(){
+  particles.forEach(p=>{
+    ctx.fillStyle=p.col;
+    ctx.globalAlpha = Math.min(1, p.life/30);
+    ctx.fillRect(p.x-cam.x,p.y,2,2);
+  });
+  ctx.globalAlpha=1;
+}
+
+function drawForegroundGrass(){
+  // grass tufts on every grass top (decorative, in front)
+  const x0 = Math.floor(cam.x/TS)-1, x1 = Math.ceil((cam.x+W)/TS)+1;
+  for(let y=0;y<level.h;y++){
+    for(let tx=x0;tx<=x1;tx++){
+      if(tx<0||tx>=level.w) continue;
+      if(level.rows[y][tx]==='#'){
+        const px = tx*TS - cam.x, py = y*TS;
+        const seed = (tx*73+y*17)%5;
+        if(seed<2){
+          ctx.fillStyle='#5fa83a';
+          ctx.fillRect(px+4+seed*2,py-2,1,2);
+          ctx.fillRect(px+5+seed*2,py-3,1,1);
+          ctx.fillRect(px+12-seed,py-2,1,2);
+        }
+        if(seed===3){
+          // tiny flower
+          ctx.fillStyle='#ffd6e8'; ctx.fillRect(px+8,py-3,2,2);
+          ctx.fillStyle='#ffec7a'; ctx.fillRect(px+8,py-3,1,1);
+        }
+      }
+    }
+  }
+}
+
+function render(){
+  drawSky();
+  drawWorld();
+  drawHerbs();
+  drawBees();
+  drawPlayer();
+  drawForegroundGrass();
+  drawParticles();
+}
+
+// ---------- OVERLAY ----------
+const overlay = document.getElementById('overlay');
+function showOverlay(title,text,btn){
+  document.getElementById('ovTitle').textContent=title;
+  document.getElementById('ovText').textContent=text;
+  document.getElementById('ovBtn').textContent=btn;
+  overlay.style.display='flex';
+}
+function hideOverlay(){ overlay.style.display='none'; }
+document.getElementById('ovBtn').addEventListener('click', () => {
+  hideOverlay();
+  if(state==='over'){ lives=3; levelIdx=0; document.getElementById('lives').textContent=lives; loadLevel(0); state='play'; }
+  else if(state==='win'){ lives=3; levelIdx=0; document.getElementById('lives').textContent=lives; loadLevel(0); state='play'; }
+  else { state='play'; }
+});
+
+// ---------- MAIN LOOP ----------
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(40, now-last); last=now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+// fit canvas to viewport while keeping aspect
+function fit(){
+  const ratio = W/H;
+  const vw = innerWidth-20, vh = innerHeight-20;
+  let cw=vw, ch=vw/ratio;
+  if(ch>vh){ ch=vh; cw=vh*ratio; }
+  cvs.style.width=cw+'px'; cvs.style.height=ch+'px';
+}
+addEventListener('resize', fit); fit();
+
+loadLevel(0);
+showOverlay('Willkommen im Kräuterwald','Sammle alle Heilkräuter und finde den leuchtenden Wegweiser am Waldrand. In der ersten Lichtung bist du noch ungestört - die Bienen kommen erst in den späteren Wäldern. Pfeiltasten bewegen, Leertaste springt.','Los geht\'s');
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
